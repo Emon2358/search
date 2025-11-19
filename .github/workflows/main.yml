@@ -1,12 +1,20 @@
-name: Scrape X profile posts
+name: Scrape X post by query
 
 on:
   workflow_dispatch:
     inputs:
-      username:
-        description: 'X username (without @). Overrides TARGET_USERNAME env'
+      query:
+        description: 'Search query to find the specific post (required). Put the exact post text if you want to match verbatim.'
+        required: true
+        default: ''
+      regex:
+        description: 'Treat query as regex (true/false)'
         required: false
-        default: 'luchia'
+        default: 'false'
+      exact:
+        description: 'Require normalized exact match of the full post text (true/false)'
+        required: false
+        default: 'false'
   schedule:
     - cron: '0 1 * * *'
 
@@ -28,10 +36,12 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps
 
-      - name: Run scraper
+      - name: Run scraper (site-wide search)
         id: run_scraper
         env:
-          TARGET_USERNAME: ${{ github.event.inputs.username || 'luchia' }}
+          QUERY: ${{ github.event.inputs.query }}
+          REGEX: ${{ github.event.inputs.regex || 'false' }}
+          EXACT: ${{ github.event.inputs.exact || 'false' }}
           MAX_POSTS: '500'
           MAX_SCROLLS: '60'
           SCROLL_PAUSE: '1.0'
@@ -39,7 +49,9 @@ jobs:
           TIMEOUT_S: '120'
         run: |
           python scripts/scrape.py \
-            --username "${TARGET_USERNAME}" \
+            --query "${QUERY}" \
+            $( [[ "${REGEX}" == "true" ]] && echo "--regex" || echo "" ) \
+            $( [[ "${EXACT}" == "true" ]] && echo "--exact" || echo "" ) \
             --max-posts "${MAX_POSTS}" \
             --max-scrolls "${MAX_SCROLLS}" \
             --scroll-pause "${SCROLL_PAUSE}" \
