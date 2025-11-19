@@ -8,7 +8,6 @@ on:
         required: false
         default: 'luchia'
   schedule:
-    # daily at 01:00 UTC (change as needed)
     - cron: '0 1 * * *'
 
 jobs:
@@ -27,7 +26,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Playwright browsers
           playwright install --with-deps
 
       - name: Run scraper
@@ -38,13 +36,15 @@ jobs:
           MAX_SCROLLS: '60'
           SCROLL_PAUSE: '1.0'
           HEADLESS: 'true'
+          TIMEOUT_S: '120'
         run: |
           python scripts/scrape.py \
             --username "${TARGET_USERNAME}" \
             --max-posts "${MAX_POSTS}" \
             --max-scrolls "${MAX_SCROLLS}" \
             --scroll-pause "${SCROLL_PAUSE}" \
-            --headless "${HEADLESS}"
+            --headless "${HEADLESS}" \
+            --timeout "${TIMEOUT_S}"
 
       - name: Upload posts.json artifact
         uses: actions/upload-artifact@v4
