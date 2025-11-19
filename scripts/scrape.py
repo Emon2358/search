@@ -3,22 +3,41 @@ import argparse
 import json
 import time
 import sys
+import re
 from datetime import datetime
 from typing import List, Dict
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    # collapse whitespace, strip, lower
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+def text_matches(query: str, text: str, use_regex: bool = False) -> bool:
+    if not query:
+        return True
+    if text is None:
+        return False
+    if use_regex:
+        try:
+            return re.search(query, text, flags=re.IGNORECASE) is not None
+        except re.error:
+            # invalid regex -> no match
+            return False
+    # simple normalized substring match
+    return normalize_text(query) in normalize_text(text)
 
 def extract_posts_from_articles(articles) -> List[Dict]:
     posts = []
     for a in articles:
         try:
-            link_el = None
             anchors = a.query_selector_all("a")
             status_href = None
             for an in anchors:
                 href = an.get_attribute("href") or ""
                 if "/status/" in href:
                     status_href = href
-                    link_el = an
                     break
             if status_href:
                 status_id = status_href.rstrip("/").split("/")[-1]
@@ -59,11 +78,6 @@ def extract_posts_from_articles(articles) -> List[Dict]:
     return posts
 
 def navigate_with_retries(page, url: str, timeout_s: int, max_attempts: int = 3) -> bool:
-    """
-    Try to navigate to url with networkidle. On timeout, fallback to domcontentloaded
-    and wait for an 'article' element. Retry a few times with backoff.
-    Returns True if navigation succeeded enough to continue scraping.
-    """
     for attempt in range(1, max_attempts + 1):
         try:
             print(f"Navigating to {url} (attempt {attempt}/{max_attempts}) - wait_until=networkidle")
@@ -71,16 +85,13 @@ def navigate_with_retries(page, url: str, timeout_s: int, max_attempts: int = 3)
             return True
         except PlaywrightTimeoutError:
             print(f"Warning: networkidle timeout on attempt {attempt}/{max_attempts}")
-            # try fallback
             try:
                 print(f"Fallback: goto with domcontentloaded and wait for 'article' (attempt {attempt})")
                 page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded")
-                # wait for at least one article to appear (shorter timeout)
                 page.wait_for_selector("article", timeout=10_000)
                 return True
             except PlaywrightTimeoutError:
                 print(f"Warning: domcontentloaded/article wait failed on attempt {attempt}")
-                # small backoff before retrying
                 time.sleep(2 * attempt)
                 continue
             except Exception as e:
@@ -93,8 +104,20 @@ def navigate_with_retries(page, url: str, timeout_s: int, max_attempts: int = 3)
             continue
     return False
 
-def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pause: float = 1.0, headless: bool = True, timeout_s: int = 120):
-    url = f"https://x.com/{username}"
+def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pause: float = 1.0, headless: bool = True, timeout_s: int = 120, query: str = "", regex: bool = False, exact: bool = False):
+    """
+    If username is provided, scrape the user's profile as before.
+    If username is empty, perform a site-wide search using X's search page for the provided query.
+    """
+    if username:
+        url = f"https://x.com/{username}"
+    else:
+        # Use X's search page (live results) for the query.
+        # encode query for URL
+        from urllib.parse import quote_plus
+        encoded = quote_plus(query or "")
+        url = f"https://x.com/search?q={encoded}&f=live"
+
     print(f"Start scraping {url} (max_posts={max_posts}, max_scrolls={max_scrolls}, timeout_s={timeout_s})")
 
     with sync_playwright() as p:
@@ -110,11 +133,8 @@ def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pa
         ok = navigate_with_retries(page, url, timeout_s=timeout_s, max_attempts=3)
         if not ok:
             print("Error: Failed to load page after retries. Attempting to continue with current content (if any).")
-            # If navigation completely failed, attempt to continue but warn user
-            # Optionally exit with error: here we continue and will likely collect nothing.
-        else:
-            # give a short pause for any lazy JS
-            time.sleep(1.0)
+
+        time.sleep(1.0)
 
         collected: Dict[str, Dict] = {}
         prev_count = 0
@@ -123,6 +143,7 @@ def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pa
 
         while len(collected) < max_posts and scrolls < max_scrolls and idle_rounds < 5:
             try:
+                # search results and profile pages both use article elements for posts
                 articles = page.query_selector_all("article")
             except Exception as e:
                 print("Warning: failed to query article elements:", e)
@@ -157,6 +178,21 @@ def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pa
 
         posts_list = list(collected.values())
 
+        # If we're using site-wide search (username not provided), the search URL already filters,
+        # but we still apply an additional filter to narrow down to the exact post if requested.
+        if query:
+            if exact:
+                # exact match: normalized full-text equality
+                nq = normalize_text(query)
+                matched = [p for p in posts_list if normalize_text(p.get("text", "")) == nq]
+            else:
+                matched = []
+                for p in posts_list:
+                    if text_matches(query, p.get("text", ""), use_regex=regex):
+                        matched.append(p)
+            posts_list = matched
+            print(f"After filtering with query (regex={regex}, exact={exact}): matched {len(posts_list)} posts")
+
         def sort_key(item):
             ts = item.get("timestamp")
             if not ts:
@@ -172,7 +208,10 @@ def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pa
         with open("posts.json", "w", encoding="utf-8") as f:
             json.dump({
                 "scraped_at": datetime.utcnow().isoformat() + "Z",
-                "target": username,
+                "target": username or "site-search",
+                "query": query,
+                "regex": regex,
+                "exact": exact,
                 "count": len(posts_list),
                 "posts": posts_list
             }, f, ensure_ascii=False, indent=2)
@@ -181,13 +220,16 @@ def scrape(username: str, max_posts: int = 500, max_scrolls: int = 60, scroll_pa
         browser.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape public X profile posts using Playwright.")
-    parser.add_argument("--username", "-u", required=True, help="X username (without @). e.g. luchia")
+    parser = argparse.ArgumentParser(description="Scrape public X posts using Playwright. If --username is omitted, performs site-wide search for --query.")
+    parser.add_argument("--username", "-u", required=False, default="", help="X username (without @). If omitted, the tool will search the site for --query")
     parser.add_argument("--max-posts", type=int, default=500, help="Maximum number of posts to collect")
     parser.add_argument("--max-scrolls", type=int, default=60, help="Maximum scroll attempts")
     parser.add_argument("--scroll-pause", type=float, default=1.0, help="Seconds to wait after each scroll")
     parser.add_argument("--headless", type=lambda s: s.lower() in ("1", "true", "yes"), default=True, help="Run browser headless")
     parser.add_argument("--timeout", type=int, default=120, help="Navigation timeout in seconds (default 120)")
+    parser.add_argument("--query", type=str, required=True, help="Search query string (required). When --username is omitted, script will perform site-wide search for this query.")
+    parser.add_argument("--regex", action="store_true", help="Treat --query as a regular expression (case-insensitive).")
+    parser.add_argument("--exact", action="store_true", help="Require normalized exact match of the entire post text (useful to find the single post verbatim).")
     args = parser.parse_args()
 
     try:
@@ -197,7 +239,10 @@ def main():
             max_scrolls=args.max_scrolls,
             scroll_pause=args.scroll_pause,
             headless=args.headless,
-            timeout_s=args.timeout
+            timeout_s=args.timeout,
+            query=args.query,
+            regex=args.regex,
+            exact=args.exact
         )
     except Exception as e:
         print("Error: uncaught exception in scraper:", e, file=sys.stderr)
